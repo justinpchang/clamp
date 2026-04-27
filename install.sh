@@ -130,4 +130,4 @@ echo "$(bold "All set.") To start:"
 echo "    $(green 'clamp')                   # in current dir"
 echo "    $(green 'clamp ~/dev/myproject')   # in a specific dir"
 echo
-echo "Inside, press $(bold "C-g") for the command palette (switch / reference / new thread)."
+echo "Inside, press $(bold "C-g") for the command palette (switch / reference / handoff / new thread)."

@@ -83,6 +83,18 @@ cmd_start() {
             "claude $CLAMP_CLAUDE_FLAGS"
     fi
 
+    # Expose CLAMP_LIB to the tmux server's global env so shell commands
+    # spawned by status-bar #(...) substitutions can find lib/status-line.sh.
+    # Idempotent — safe to re-set on every start.
+    "${TMUX_CMD[@]}" set-environment -g CLAMP_LIB "$CLAMP_LIB"
+
+    # Re-source the conf so an already-running server picks up changes
+    # (status-right format, colors, etc.) without requiring `clamp kill`.
+    # tmux only loads -f at first server boot, so we have to source again
+    # here for upgrades to take effect on existing sessions.
+    "${TMUX_CMD[@]}" source-file "$CLAMP_CONF" 2>/dev/null || true
+    "${TMUX_CMD[@]}" refresh-client -S 2>/dev/null || true
+
     install_bindings
 
     if [[ -n "${TMUX:-}" ]]; then
@@ -106,6 +118,20 @@ cmd_start() {
 cmd_kill() {
     "${TMUX_CMD[@]}" kill-server 2>/dev/null || true
     echo "clamp tmux server stopped."
+}
+
+# Re-source tmux.conf and refresh status, without disturbing running panes.
+# Useful after editing tmux.conf or upgrading clamp while a session is alive.
+cmd_reload() {
+    if ! "${TMUX_CMD[@]}" list-sessions >/dev/null 2>&1; then
+        echo "no clamp tmux server running."
+        return 0
+    fi
+    "${TMUX_CMD[@]}" set-environment -g CLAMP_LIB "$CLAMP_LIB"
+    "${TMUX_CMD[@]}" source-file "$CLAMP_CONF"
+    "${TMUX_CMD[@]}" refresh-client -S
+    install_bindings
+    echo "clamp tmux conf reloaded."
 }
 
 cmd_install_skill() {
@@ -474,6 +500,7 @@ main() {
     case "$1" in
         start)         shift; cmd_start "$@" ;;
         kill)          cmd_kill ;;
+        reload)        cmd_reload ;;
         install-skill) cmd_install_skill ;;
         list-threads)  shift; cmd_list_threads "$@" ;;
         render)        shift; cmd_render "$@" ;;
