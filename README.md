@@ -17,6 +17,16 @@ opens with three commands:
 - **reference**  — same picker, but Enter inserts `@@<uuid> ` into the
   current claude prompt buffer (via `tmux send-keys -l`). Use this to ask
   Claude to read a prior thread.
+- **handoff**    — type a one-line prompt for what you want to do next.
+  Clamp fires a one-shot `claude -p --model haiku` (override via
+  `$CLAMP_HANDOFF_MODEL`) that gets `@@<uuid>` and uses the `read-thread`
+  skill to pull only the relevant parts of the prior thread (so long
+  transcripts don't blow the context window), then synthesizes a tight
+  handoff summary aimed at the next task. Clamp opens a fresh `claude` in
+  the pane and pre-fills its prompt with `Continuing work from thread
+  @@<uuid>. … <next task> … <summary>`. The new thread can also call the
+  `read-thread` skill on `@@<uuid>` to recover any detail the summary
+  skipped.
 - **new**        — start a fresh thread (`claude`) in the current pane.
 
 Threads are read from `~/.claude/projects/<encoded-cwd>/*.jsonl`, sorted by
@@ -121,10 +131,11 @@ Key design choices:
 
 Environment variables read by `clamp`:
 
-| Var            | Default | Meaning |
-|----------------|---------|---------|
-| `CLAMP_HOTKEY` | `C-g`   | tmux key that opens the palette |
-| `CLAMP_SOCKET` | `clamp` | `tmux -L` socket name |
+| Var                   | Default | Meaning |
+|-----------------------|---------|---------|
+| `CLAMP_HOTKEY`        | `C-g`   | tmux key that opens the palette |
+| `CLAMP_SOCKET`        | `clamp` | `tmux -L` socket name |
+| `CLAMP_HANDOFF_MODEL` | `haiku` | model used for the one-shot summary in `handoff` |
 
 Example: `CLAMP_HOTKEY="M-o" clamp start`
 

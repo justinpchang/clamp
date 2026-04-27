@@ -38,6 +38,8 @@ readonly CLAMP_CONF="$CLAMP_ROOT/tmux.conf"
 # prompts so the wrapper stays out of your way; override with an env var to
 # tighten back up.
 readonly CLAMP_CLAUDE_FLAGS="${CLAMP_CLAUDE_FLAGS:---dangerously-skip-permissions}"
+# Model used for the one-shot summary in `clamp handoff`. Override via env.
+readonly CLAMP_HANDOFF_MODEL="${CLAMP_HANDOFF_MODEL:-haiku}"
 
 readonly TMUX_CMD=(tmux -L "$CLAMP_SOCKET")
 
@@ -206,6 +208,7 @@ cmd_picker() {
     choice="$(printf '%s\n' \
         "switch     Switch to an existing thread" \
         "reference  Insert @@<thread-id> reference into prompt" \
+        "handoff    Hand off context to a fresh thread (auto-summarized)" \
         "new        Start a new thread" \
         | fzf --ansi --no-multi \
               --prompt="clamp ❯ " \
@@ -217,6 +220,7 @@ cmd_picker() {
     case "${choice%% *}" in
         switch)    cmd_switch ;;
         reference) cmd_reference ;;
+        handoff)   cmd_handoff ;;
         new)       cmd_new ;;
         *)         return 0 ;;
     esac
@@ -306,6 +310,139 @@ cmd_new() {
         "claude $CLAMP_CLAUDE_FLAGS"
 }
 
+# -------- Handoff: summarize current thread, prefill new one --------
+#
+# UX:
+#   1. Find the active thread for this project (= newest .jsonl).
+#   2. Prompt the user (in the popup) for what they want to do next.
+#   3. Run a one-shot `claude -p` call — model overridable via
+#      $CLAMP_HANDOFF_MODEL — to compress the transcript into a handoff
+#      summary aimed at the user's next intent.
+#   4. Build the new prompt:
+#        Continuing work from thread @@<sid>. When you lack specific
+#        information, use the read-thread skill (@@<sid>) to retrieve it.
+#        Next task: <intent>
+#        Handoff summary: <summary>
+#   5. Stage the prompt in a tmux paste buffer, respawn the pane with a
+#      fresh `claude`, and defer the paste-buffer until claude is up.
+cmd_handoff() {
+    resolve_target
+    local proj="$CLAMP_PROJECT_DIR"
+
+    # Resolve the active thread: newest .jsonl in the project's encoded dir.
+    local encoded="${proj//\//-}"
+    local pdir="$HOME/.claude/projects/$encoded"
+    local current_sid=""
+    if [[ -d "$pdir" ]]; then
+        local newest
+        newest="$(ls -t "$pdir"/*.jsonl 2>/dev/null | head -1 || true)"
+        [[ -n "$newest" ]] && current_sid="$(basename "$newest" .jsonl)"
+    fi
+    if [[ -z "$current_sid" ]]; then
+        echo "No active thread found in $pdir"
+        echo "(Press any key to close)"
+        read -rsn1
+        return 1
+    fi
+
+    # Show the title (first user message) for context.
+    local title=""
+    if command -v python3 >/dev/null 2>&1; then
+        title="$(python3 "$CLAMP_LIB/list-threads.py" "$proj" 2>/dev/null \
+                 | awk -F'\t' -v sid="$current_sid" '$1==sid {print $4; exit}')"
+    fi
+
+    clear || true
+    echo "Handoff from thread:"
+    echo "  $current_sid"
+    [[ -n "$title" ]] && echo "  ($title)"
+    echo
+    echo "Type the prompt for the new thread (what you want to do next),"
+    echo "then press Enter. Esc/empty cancels."
+    echo
+
+    local user_intent=""
+    # -e enables readline editing; -r keeps backslashes literal.
+    if ! read -r -e -p "next task ❯ " user_intent; then
+        return 0
+    fi
+    [[ -z "${user_intent// /}" ]] && return 0
+
+    echo
+    echo "Generating handoff summary via 'claude -p --model $CLAMP_HANDOFF_MODEL'…"
+
+    # Don't pipe the transcript — for long threads it blows the context
+    # window. Instead, send the @@<uuid> reference and rely on the
+    # read-thread skill to spawn a Task subagent that reads the JSONL and
+    # returns only the parts relevant to the user's next task. Haiku then
+    # synthesizes the final handoff summary from what the subagent returns.
+    local summary_input handoff_summary
+    summary_input=$'You are producing a handoff summary for a fresh Claude Code thread.\n\n'
+    summary_input+="@@$current_sid"
+    summary_input+=$'\n\nThe ↑ reference is the prior thread. Use the read-thread skill to read\n'
+    summary_input+=$'it (it spawns a Task subagent that walks the JSONL transcript) — DO NOT\n'
+    summary_input+=$'try to read the JSONL inline yourself. The next task the user wants to\n'
+    summary_input+=$'work on in the new thread is:\n\n'
+    summary_input+="    $user_intent"
+    summary_input+=$'\n\nWhen the read-thread subagent returns, synthesize a concise handoff\n'
+    summary_input+=$'(≤300 words, plain prose + short bullet lists) covering ONLY what is\n'
+    summary_input+=$'relevant to that next task:\n'
+    summary_input+=$'  • files/paths that were touched or are relevant\n'
+    summary_input+=$'  • decisions made and approaches that worked\n'
+    summary_input+=$'  • approaches that were tried and abandoned (and why)\n'
+    summary_input+=$'  • open questions or in-flight work\n'
+    summary_input+=$'  • a short suggested first step for the next thread\n\n'
+    summary_input+=$'Output ONLY the handoff summary as plain text — no preamble, no\n'
+    summary_input+=$'trailing commentary, no markdown headings about "Summary:".\n'
+
+    # Pass --dangerously-skip-permissions so the haiku agent can spawn the
+    # read-thread Task subagent without hitting permission prompts (we are
+    # strictly non-interactive here).
+    handoff_summary="$(printf '%s' "$summary_input" \
+        | claude -p --dangerously-skip-permissions \
+                 --model "$CLAMP_HANDOFF_MODEL" 2>/dev/null || true)"
+
+    if [[ -z "${handoff_summary// /}" ]]; then
+        handoff_summary="(automatic summary failed — read the source thread @@$current_sid for full context)"
+    fi
+
+    local new_prompt
+    new_prompt="Continuing work from thread @@$current_sid. When you lack specific information you can use the read-thread skill to retrieve it.
+
+Next task (from the user):
+$user_intent
+
+Handoff summary:
+$handoff_summary
+"
+
+    # Stage and dispatch. Same deferred-paste trick as cmd_reference, but we
+    # also respawn the pane first with a fresh claude. The sleep gives
+    # claude's TUI time to come up before we shove keystrokes at it.
+    local target="$CLAMP_TARGET_PANE"
+    local log=/tmp/clamp.log
+
+    "${TMUX_CMD[@]}" set-buffer -b clamp-handoff -- "$new_prompt"
+
+    {
+        echo "--- $(date '+%H:%M:%S') handoff dispatch"
+        echo "target=$target src_sid=$current_sid intent=[$user_intent]"
+        echo "summary_len=${#handoff_summary}"
+    } >>"$log" 2>&1
+
+    "${TMUX_CMD[@]}" respawn-pane -k -t "$target" \
+        -c "$CLAMP_PROJECT_DIR" \
+        "claude $CLAMP_CLAUDE_FLAGS"
+
+    # Defer paste so it runs after this popup closes AND claude has booted.
+    "${TMUX_CMD[@]}" run-shell -b "
+        echo '[bg $(date +%H:%M:%S)] handoff: waiting for claude to boot' >> $log 2>&1
+        sleep 1.5
+        tmux -L $CLAMP_SOCKET paste-buffer -t $target -d -p -b clamp-handoff >> $log 2>&1 || true
+        echo '[bg $(date +%H:%M:%S)] handoff: paste done' >> $log 2>&1
+    "
+}
+
 usage() {
     cat <<EOF
 clamp — claude + amp-style thread command palette
@@ -313,16 +450,17 @@ clamp — claude + amp-style thread command palette
 Usage:
   clamp [dir]    Run claude in [dir] (default: \$PWD) wrapped in clamp's
                  tmux. Press $CLAMP_HOTKEY to open the command palette
-                 (switch / reference / new thread). Quit claude (Ctrl-D or
-                 /exit) to tear everything down.
+                 (switch / reference / handoff / new thread). Quit claude
+                 (Ctrl-D or /exit) to tear everything down.
 
 Setup:
   ./install.sh   Install or upgrade. Re-run anytime.
 
 Env:
-  CLAMP_HOTKEY        tmux key for the palette  (default: C-g)
-  CLAMP_CLAUDE_FLAGS  flags passed to claude    (default: --dangerously-skip-permissions)
-  CLAMP_SOCKET        tmux -L socket name       (default: clamp)
+  CLAMP_HOTKEY         tmux key for the palette   (default: C-g)
+  CLAMP_CLAUDE_FLAGS   flags passed to claude     (default: --dangerously-skip-permissions)
+  CLAMP_SOCKET         tmux -L socket name        (default: clamp)
+  CLAMP_HANDOFF_MODEL  model for handoff summary  (default: haiku)
 EOF
 }
 
@@ -342,6 +480,7 @@ main() {
         picker)        cmd_picker ;;
         switch)        cmd_switch ;;
         reference)     cmd_reference ;;
+        handoff)       cmd_handoff ;;
         new)           cmd_new ;;
         help|-h|--help) usage ;;
         # Anything else (a path, etc.) is treated as a `start` argument.
