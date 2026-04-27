@@ -12,8 +12,10 @@ Press the hotkey from anywhere inside the wrapped `claude` session. A popup
 opens with three commands:
 
 - **switch**     — fzf list of every prior thread for this project, with a
-  formatted transcript in the preview pane. Enter resumes that thread in the
-  current pane (`claude --resume <uuid>`).
+  formatted transcript in the preview pane. Enter resumes that thread —
+  in a *new tmux window* (`claude --resume <uuid>`) so the thread you
+  came from keeps running. If the picked thread is already open in some
+  window, switch jumps to that window instead of spawning a duplicate.
 - **reference**  — same picker, but Enter inserts `@@<uuid> ` into the
   current claude prompt buffer (via `tmux send-keys -l`). Use this to ask
   Claude to read a prior thread.
@@ -23,11 +25,19 @@ opens with three commands:
   skill to pull only the relevant parts of the prior thread (so long
   transcripts don't blow the context window), then synthesizes a tight
   handoff summary aimed at the next task. Clamp opens a fresh `claude` in
-  the pane and pre-fills its prompt with `Continuing work from thread
-  @@<uuid>. … <next task> … <summary>`. The new thread can also call the
-  `read-thread` skill on `@@<uuid>` to recover any detail the summary
-  skipped.
-- **new**        — start a fresh thread (`claude`) in the current pane.
+  a new window (the source thread keeps running) and pre-fills its
+  prompt with `Continuing work from thread @@<uuid>. … <next task> …
+  <summary>`. The new thread can also call the `read-thread` skill on
+  `@@<uuid>` to recover any detail the summary skipped.
+- **new**        — start a fresh thread (`claude`) in a new window.
+
+Each thread runs in its own tmux window inside the project session, so
+switching between them is non-destructive — old claude processes keep
+running in the background. The status bar shows one tab per thread; use
+tmux's normal window keys (`prefix n`/`p`/`<num>`) to flip between them
+without going through the picker. Quit a window's claude (`Ctrl-D` or
+`/exit`) and tmux closes the window. Quit the last one and clamp tears
+its tmux server down.
 
 Threads are read from `~/.claude/projects/<encoded-cwd>/*.jsonl`, sorted by
 mtime, with title = first user message.
@@ -94,7 +104,7 @@ To see the rendered thread yourself: `clamp render <UUID>`.
 ```
 ~/.local/bin/clamp start
      │
-     │ tmux -L clamp -f tmux.conf new-session  (cwd-named session, pane 0 runs `claude`)
+     │ tmux -L clamp -f tmux.conf new-session  (cwd-named session, window 0 runs `claude`)
      │ tmux -L clamp bind-key -T root C-g  display-popup -E "clamp picker"
      ▼
   isolated tmux server (socket: "clamp")
@@ -104,12 +114,16 @@ To see the rendered thread yourself: `clamp render <UUID>`.
   tmux display-popup runs `clamp picker` with CLAMP_TARGET_PANE=#{pane_id}
      │
      ├─ switch    → fzf with --preview "clamp render {1}"
-     │              on Enter: tmux respawn-pane -k -t $TARGET "claude --resume <id>"
+     │              if window already tagged with that sid: select-window
+     │              else: new-window "claude --resume <id>" and tag it
+     │              (existing windows keep running untouched)
      │
      ├─ reference → fzf with --preview "clamp render {1}"
      │              on Enter: tmux send-keys -t $TARGET -l "@@<id> "
      │
-     └─ new       → tmux respawn-pane -k -t $TARGET "claude"
+     ├─ handoff   → new-window "claude" + deferred-paste of summary
+     │
+     └─ new       → new-window "claude"
 ```
 
 Key design choices:
@@ -154,8 +168,9 @@ session and disappears as soon as you pick something.
   background as you scroll, we'd need to spawn (and cache) a `claude
   --resume <id>` process per thread you navigate to and use
   `tmux switch-client` between them. Not hard, but materially more code.
-- Switching threads kills the current `claude` process via `respawn-pane
-  -k`. Anything claude hadn't yet flushed to the .jsonl is lost. In practice
-  claude persists messages on each turn so this is fine.
+- Fresh threads (`new` and `handoff`) can't be tagged with a sid until
+  claude assigns one (after the first message lands in the .jsonl). If you
+  later use `switch` to resume that thread, you get a duplicate window
+  running the same sid. Close the old one, or just don't.
 - Cross-project thread browsing isn't supported — clamp only lists threads
   whose `cwd` matches the pane's current path.
