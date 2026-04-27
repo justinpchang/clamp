@@ -33,11 +33,10 @@ opens with three commands:
 
 Each thread runs in its own tmux window inside the project session, so
 switching between them is non-destructive — old claude processes keep
-running in the background. The status bar shows one tab per thread; use
-tmux's normal window keys (`prefix n`/`p`/`<num>`) to flip between them
-without going through the picker. Quit a window's claude (`Ctrl-D` or
-`/exit`) and tmux closes the window. Quit the last one and clamp tears
-its tmux server down.
+running in the background. The window list is intentionally hidden —
+navigate threads via the `switch` palette, not via tmux's window keys.
+Quit a thread's claude (`Ctrl-D` or `/exit`) and tmux closes its
+window; quit the last one and clamp tears its tmux server down.
 
 Threads are read from `~/.claude/projects/<encoded-cwd>/*.jsonl`, sorted by
 mtime, with title = first user message.
