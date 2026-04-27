@@ -141,24 +141,3 @@ Environment variables read by `clamp`:
 | `CLAMP_HANDOFF_MODEL` | `haiku` | model used for the one-shot summary in `handoff` |
 
 Example: `CLAMP_HOTKEY="M-o" clamp start`
-
-## Why not extend agent-deck?
-
-[`agent-deck`](https://github.com/asheshgoplani/agent-deck) is a great tool
-but it's a full Bubble Tea TUI dashboard (~14k lines) that *replaces* your
-terminal context with a session manager. Clamp is the opposite: ~250 lines
-total, the dashboard is a fzf popup that overlays your existing claude
-session and disappears as soon as you pick something.
-
-## Limitations / future work
-
-- The "preview" is a rendered transcript, not a live claude TUI. If you want
-  the exact Amp behavior of swapping a real claude session in the
-  background as you scroll, we'd need to spawn (and cache) a `claude
-  --resume <id>` process per thread you navigate to and use
-  `tmux switch-client` between them. Not hard, but materially more code.
-- Switching threads kills the current `claude` process via `respawn-pane
-  -k`. Anything claude hadn't yet flushed to the .jsonl is lost. In practice
-  claude persists messages on each turn so this is fine.
-- Cross-project thread browsing isn't supported — clamp only lists threads
-  whose `cwd` matches the pane's current path.
