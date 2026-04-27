@@ -77,12 +77,9 @@ cmd_start() {
 
     # Create the session if missing. -f only takes effect when the server is
     # being started for the first time; otherwise it is silently ignored.
-    # Each thread lives in its own window inside this session, so attaching
-    # later reattaches to whatever windows are still running.
     if ! "${TMUX_CMD[@]}" has-session -t "=$sess" 2>/dev/null; then
         "${TMUX_CMD[@]}" -f "$CLAMP_CONF" new-session -d -s "$sess" -c "$dir" \
             -e "CLAMP_PROJECT_DIR=$dir" \
-            -n "new" \
             "claude $CLAMP_CLAUDE_FLAGS"
     fi
 
@@ -289,52 +286,16 @@ _thread_picker() {
     echo "$sid"
 }
 
-# Print the tmux session name that owns the resolved target pane.
-_target_session() {
-    "${TMUX_CMD[@]}" display-message -p -t "$CLAMP_TARGET_PANE" \
-        -F '#{session_name}'
-}
-
-# Echo the window id of an existing window in $sess that is tagged with the
-# given sid, or empty if none. Tags are set by cmd_switch when it spawns
-# a `claude --resume <sid>` window.
-_window_for_sid() {
-    local sess="$1" sid="$2"
-    "${TMUX_CMD[@]}" list-windows -t "$sess" \
-        -F '#{window_id} #{@clamp_sid}' 2>/dev/null \
-        | awk -v s="$sid" '$2==s {print $1; exit}'
-}
-
 cmd_switch() {
     resolve_target
     local sid
     sid="$(_thread_picker switch)" || return 0
     [[ -z "${sid:-}" ]] && return 0
 
-    local sess
-    sess="$(_target_session)"
-    [[ -z "$sess" ]] && fatal "couldn't determine target session"
-
-    # Already running in some window? Just jump to it — leave its claude
-    # process untouched.
-    local existing
-    existing="$(_window_for_sid "$sess" "$sid")"
-    if [[ -n "$existing" ]]; then
-        "${TMUX_CMD[@]}" select-window -t "$existing"
-        return 0
-    fi
-
-    # Otherwise spawn a fresh window with `claude --resume <sid>` and tag
-    # it so subsequent switches dedupe to the same window.
-    local new_wid
-    new_wid="$("${TMUX_CMD[@]}" new-window -t "$sess:" \
+    # Respawn the pane with `claude --resume <sid>`.
+    "${TMUX_CMD[@]}" respawn-pane -k -t "$CLAMP_TARGET_PANE" \
         -c "$CLAMP_PROJECT_DIR" \
-        -n "${sid:0:8}" \
-        -P -F '#{window_id}' \
-        "claude $CLAMP_CLAUDE_FLAGS --resume $sid")"
-    if [[ -n "$new_wid" ]]; then
-        "${TMUX_CMD[@]}" set-option -w -t "$new_wid" @clamp_sid "$sid"
-    fi
+        "claude $CLAMP_CLAUDE_FLAGS --resume $sid"
 }
 
 cmd_reference() {
@@ -370,17 +331,8 @@ cmd_reference() {
 
 cmd_new() {
     resolve_target
-    local sess
-    sess="$(_target_session)"
-    [[ -z "$sess" ]] && fatal "couldn't determine target session"
-
-    # Fresh thread → new window. The original pane keeps running its claude
-    # untouched. We don't know the sid yet (claude assigns one after the
-    # first message), so the window stays untagged; switching to it later
-    # via the picker will spawn a duplicate window — accept that for now.
-    "${TMUX_CMD[@]}" new-window -t "$sess:" \
+    "${TMUX_CMD[@]}" respawn-pane -k -t "$CLAMP_TARGET_PANE" \
         -c "$CLAMP_PROJECT_DIR" \
-        -n "new" \
         "claude $CLAMP_CLAUDE_FLAGS"
 }
 
@@ -490,37 +442,29 @@ Handoff summary:
 $handoff_summary
 "
 
-    # Stage and dispatch. Open a NEW window (so the source thread keeps
-    # running in its own window untouched), then deferred-paste the
-    # prompt into the new window's pane after claude has booted.
-    local sess new_wid new_pane
-    sess="$(_target_session)"
-    [[ -z "$sess" ]] && fatal "couldn't determine target session"
-
+    # Stage and dispatch. Same deferred-paste trick as cmd_reference, but we
+    # also respawn the pane first with a fresh claude. The sleep gives
+    # claude's TUI time to come up before we shove keystrokes at it.
+    local target="$CLAMP_TARGET_PANE"
     local log=/tmp/clamp.log
 
     "${TMUX_CMD[@]}" set-buffer -b clamp-handoff -- "$new_prompt"
 
-    new_wid="$("${TMUX_CMD[@]}" new-window -t "$sess:" \
-        -c "$CLAMP_PROJECT_DIR" \
-        -n "handoff" \
-        -P -F '#{window_id}' \
-        "claude $CLAMP_CLAUDE_FLAGS")"
-    new_pane="$("${TMUX_CMD[@]}" list-panes -t "$new_wid" \
-        -F '#{pane_id}' 2>/dev/null | head -1)"
-
     {
         echo "--- $(date '+%H:%M:%S') handoff dispatch"
-        echo "src_pane=$CLAMP_TARGET_PANE src_sid=$current_sid"
-        echo "new_window=$new_wid new_pane=$new_pane"
-        echo "intent=[$user_intent] summary_len=${#handoff_summary}"
+        echo "target=$target src_sid=$current_sid intent=[$user_intent]"
+        echo "summary_len=${#handoff_summary}"
     } >>"$log" 2>&1
+
+    "${TMUX_CMD[@]}" respawn-pane -k -t "$target" \
+        -c "$CLAMP_PROJECT_DIR" \
+        "claude $CLAMP_CLAUDE_FLAGS"
 
     # Defer paste so it runs after this popup closes AND claude has booted.
     "${TMUX_CMD[@]}" run-shell -b "
         echo '[bg $(date +%H:%M:%S)] handoff: waiting for claude to boot' >> $log 2>&1
         sleep 1.5
-        tmux -L $CLAMP_SOCKET paste-buffer -t $new_pane -d -p -b clamp-handoff >> $log 2>&1 || true
+        tmux -L $CLAMP_SOCKET paste-buffer -t $target -d -p -b clamp-handoff >> $log 2>&1 || true
         echo '[bg $(date +%H:%M:%S)] handoff: paste done' >> $log 2>&1
     "
 }
