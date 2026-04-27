@@ -6,6 +6,9 @@ It runs `claude` inside an isolated `tmux` server (so it doesn't pollute your
 own tmux), binds a global hotkey (default `C-f`) to a `tmux display-popup`,
 and uses `fzf` for the picker UI.
 
+<img width="1251" height="814" alt="Screenshot 2026-04-27 at 5 33 19 PM" src="https://github.com/user-attachments/assets/dda2c954-d97a-4dc8-a14f-a294052d92a6" />
+
+
 ## What you get
 
 Press the hotkey from anywhere inside the wrapped `claude` session. A popup
