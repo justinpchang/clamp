@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+# clamp — claude + amp-style thread command palette
+#
+# Wraps `claude` in an isolated tmux server and adds a hotkey-driven command
+# palette for switching threads, referencing threads (@@<uuid>), and starting
+# new threads.
+#
+# Usage:
+#   clamp start [dir]       Start (or attach to) a clamp session for [dir]
+#   clamp picker            (internal) top-level command palette
+#   clamp switch            (internal) thread switcher
+#   clamp reference         (internal) thread reference picker
+#   clamp new               (internal) start a fresh thread
+#   clamp kill              Kill the clamp tmux server entirely
+#   clamp list-threads      Print TSV of threads for $PWD
+#   clamp render <sid>      Print formatted thread transcript
+
+set -euo pipefail
+
+# Resolve our own location, following any symlinks (e.g. ~/.local/bin/clamp
+# -> ~/dev/clamp/bin/clamp). Portable across macOS (BSD readlink, no -f).
+_clamp_resolve_root() {
+    local src="${BASH_SOURCE[0]}"
+    while [[ -L "$src" ]]; do
+        local dir
+        dir="$(cd -P "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        [[ $src != /* ]] && src="$dir/$src"
+    done
+    cd -P "$(dirname "$src")/.." && pwd
+}
+readonly CLAMP_ROOT="$(_clamp_resolve_root)"
+readonly CLAMP_LIB="$CLAMP_ROOT/lib"
+readonly CLAMP_SOCKET="${CLAMP_SOCKET:-clamp}"
+readonly CLAMP_HOTKEY="${CLAMP_HOTKEY:-C-g}"
+readonly CLAMP_CONF="$CLAMP_ROOT/tmux.conf"
+# Flags passed to every `claude` invocation. Defaults to bypassing permission
+# prompts so the wrapper stays out of your way; override with an env var to
+# tighten back up.
+readonly CLAMP_CLAUDE_FLAGS="${CLAMP_CLAUDE_FLAGS:---dangerously-skip-permissions}"
+
+readonly TMUX_CMD=(tmux -L "$CLAMP_SOCKET")
+
+die() { echo "clamp: $*" >&2; exit 1; }
+
+# Sanitize a path into a usable tmux session name.
+session_name_for_dir() {
+    local dir="$1" base
+    base="$(basename "$dir")"
+    # tmux disallows '.' and ':' in session names
+    base="${base//./_}"
+    base="${base//:/_}"
+    [[ -z "$base" ]] && base="clamp"
+    echo "$base"
+}
+
+# Install the hotkey binding on the running server. Idempotent.
+install_bindings() {
+    # Important: `#{pane_id}` is NOT expanded inside the shell-command arg of
+    # display-popup on every tmux build. Use `-e VAR=#{...}` instead, which
+    # is reliably format-expanded at fire time.
+    "${TMUX_CMD[@]}" bind-key -T root "$CLAMP_HOTKEY" \
+        display-popup -E -w 80% -h 80% \
+        -d "#{pane_current_path}" \
+        -e "CLAMP_TARGET_PANE=#{pane_id}" \
+        -e "CLAMP_PROJECT_DIR=#{pane_current_path}" \
+        "'$CLAMP_ROOT/bin/clamp' picker"
+}
+
+cmd_start() {
+    local dir="${1:-$PWD}"
+    dir="$(cd "$dir" && pwd)"
+    local sess
+    sess="$(session_name_for_dir "$dir")"
+
+    # Create the session if missing. -f only takes effect when the server is
+    # being started for the first time; otherwise it is silently ignored.
+    if ! "${TMUX_CMD[@]}" has-session -t "=$sess" 2>/dev/null; then
+        "${TMUX_CMD[@]}" -f "$CLAMP_CONF" new-session -d -s "$sess" -c "$dir" \
+            -e "CLAMP_PROJECT_DIR=$dir" \
+            "claude $CLAMP_CLAUDE_FLAGS"
+    fi
+
+    install_bindings
+
+    if [[ -n "${TMUX:-}" ]]; then
+        # Already inside another tmux: can't nest attach.
+        echo "You're already inside tmux. Detach first, then run: clamp $dir" >&2
+        return 1
+    fi
+
+    # Attach. When this returns, the user has either detached or claude
+    # exited (taking the pane and session with it).
+    "${TMUX_CMD[@]}" attach-session -t "$sess" || true
+
+    # If no sessions remain on the clamp server, tear the whole server down.
+    # That way `clamp` behaves like a foreground app — no daemon left over.
+    if ! "${TMUX_CMD[@]}" list-sessions >/dev/null 2>&1 \
+       || [[ -z "$("${TMUX_CMD[@]}" list-sessions 2>/dev/null)" ]]; then
+        "${TMUX_CMD[@]}" kill-server >/dev/null 2>&1 || true
+    fi
+}
+
+cmd_kill() {
+    "${TMUX_CMD[@]}" kill-server 2>/dev/null || true
+    echo "clamp tmux server stopped."
+}
+
+cmd_install_skill() {
+    local src="$CLAMP_ROOT/claude/skills/read-thread"
+    local dst="$HOME/.claude/skills/read-thread"
+
+    [[ -d "$src" ]] || die "skill source missing: $src"
+    mkdir -p "$HOME/.claude/skills"
+
+    if [[ -L "$dst" ]]; then
+        # Existing symlink: just repoint it (idempotent reinstall).
+        rm -f "$dst"
+    elif [[ -e "$dst" ]]; then
+        # Real file/dir there — refuse to clobber user content.
+        echo "Refusing to overwrite non-symlink $dst (rm it manually first)" >&2
+        return 1
+    fi
+
+    ln -s "$src" "$dst"
+    echo "Installed: $dst -> $src"
+    echo
+    echo "Claude Code will load this skill when it sees '@@<uuid>' in a prompt."
+    echo "Make sure 'clamp' is on PATH so the skill can call 'clamp render <uuid>':"
+    echo "    ln -s '$CLAMP_ROOT/bin/clamp' ~/.local/bin/clamp"
+}
+
+cmd_list_threads() {
+    local dir="${1:-$PWD}"
+    python3 "$CLAMP_LIB/list-threads.py" "$dir"
+}
+
+cmd_render() {
+    local sid="${1:-}"
+    local dir="${2:-$PWD}"
+    [[ -z "$sid" ]] && die "render: missing session-id"
+    python3 "$CLAMP_LIB/render-thread.py" "$sid" "$dir"
+}
+
+# Pause for a keypress before exit so errors are readable in a popup.
+fatal() {
+    echo >&2
+    echo "clamp: $*" >&2
+    echo >&2
+    echo "(press any key to close)" >&2
+    read -rsn1 || true
+    exit 1
+}
+
+# Resolve the originating pane id and project dir, populating
+# CLAMP_TARGET_PANE / CLAMP_PROJECT_DIR. Robust against the case where the
+# -e env-var format-expansion didn't fire (still has literal "#{...}").
+resolve_target() {
+    local target="${CLAMP_TARGET_PANE:-}"
+    if [[ -z "$target" || "$target" == *'#{'* ]]; then
+        # Strategy 1: ask the active client what session it's on, then take
+        # its first pane (clamp sessions only ever have one).
+        local sess
+        sess="$("${TMUX_CMD[@]}" list-clients -F '#{client_session}' 2>/dev/null | head -1 || true)"
+        if [[ -n "$sess" ]]; then
+            target="$("${TMUX_CMD[@]}" list-panes -t "$sess" -F '#{pane_id}' 2>/dev/null | head -1 || true)"
+        fi
+    fi
+    if [[ -z "$target" || "$target" == *'#{'* ]]; then
+        # Strategy 2: just take the first pane across all sessions on this
+        # clamp server. Works even if list-clients returns nothing.
+        target="$("${TMUX_CMD[@]}" list-panes -a -F '#{pane_id}' 2>/dev/null | head -1 || true)"
+    fi
+    if [[ -z "$target" ]]; then
+        {
+            echo "couldn't determine target pane."
+            echo "  CLAMP_TARGET_PANE=${CLAMP_TARGET_PANE:-<unset>}"
+            echo "  list-clients:"
+            "${TMUX_CMD[@]}" list-clients 2>&1 | sed 's/^/    /' || true
+            echo "  list-panes -a:"
+            "${TMUX_CMD[@]}" list-panes -a 2>&1 | sed 's/^/    /' || true
+        } >>/tmp/clamp.log
+        fatal "couldn't determine target pane (see /tmp/clamp.log)"
+    fi
+
+    local proj="${CLAMP_PROJECT_DIR:-}"
+    if [[ -z "$proj" || "$proj" == *'#{'* ]]; then
+        proj="$("${TMUX_CMD[@]}" display-message -p -t "$target" -F '#{pane_current_path}' 2>/dev/null || true)"
+    fi
+    [[ -z "$proj" ]] && proj="$PWD"
+
+    export CLAMP_TARGET_PANE="$target"
+    export CLAMP_PROJECT_DIR="$proj"
+
+    # Audit trail
+    {
+        echo "[$(date '+%H:%M:%S')] resolve_target → pane=$target proj=$proj"
+    } >>/tmp/clamp.log 2>&1 || true
+}
+
+# -------- Picker (top-level command palette) --------
+cmd_picker() {
+    resolve_target
+
+    local choice
+    choice="$(printf '%s\n' \
+        "switch     Switch to an existing thread" \
+        "reference  Insert @@<thread-id> reference into prompt" \
+        "new        Start a new thread" \
+        | fzf --ansi --no-multi \
+              --prompt="clamp ❯ " \
+              --header="$CLAMP_PROJECT_DIR" \
+              --with-nth=1.. \
+              --reverse \
+              --height=100%)" || return 0
+
+    case "${choice%% *}" in
+        switch)    cmd_switch ;;
+        reference) cmd_reference ;;
+        new)       cmd_new ;;
+        *)         return 0 ;;
+    esac
+}
+
+# -------- Thread picker shared by switch/reference --------
+# $1 = mode label ("switch"/"reference"), $2 = action callback name
+_thread_picker() {
+    local mode="$1"
+    local proj="${CLAMP_PROJECT_DIR:-$PWD}"
+
+    local lines
+    lines="$(python3 "$CLAMP_LIB/list-threads.py" "$proj")"
+    if [[ -z "$lines" ]]; then
+        echo "No prior threads found for $proj"
+        echo "(Press any key to close)"
+        read -rsn1
+        return 1
+    fi
+
+    # fzf consumes TSV: <id>\t<mtime>\t<rel>\t<title>
+    # Display: <rel>  <title>  (id hidden but kept in line for selection)
+    local sel
+    sel="$(printf '%s\n' "$lines" | fzf \
+        --ansi --no-multi --reverse --height=100% \
+        --delimiter=$'\t' \
+        --with-nth=3,4 \
+        --prompt="$mode ❯ " \
+        --header="$proj  —  ↑/↓ navigate, shift+↑/↓ scroll preview, enter selects, esc cancels" \
+        --preview="python3 $CLAMP_LIB/render-thread.py {1} $proj" \
+        --preview-window="right,65%,wrap")" || return 0
+
+    # Parse the selected session id (column 1).
+    local sid
+    sid="$(awk -F'\t' '{print $1}' <<<"$sel")"
+    [[ -z "$sid" ]] && return 0
+    echo "$sid"
+}
+
+cmd_switch() {
+    resolve_target
+    local sid
+    sid="$(_thread_picker switch)" || return 0
+    [[ -z "${sid:-}" ]] && return 0
+
+    # Respawn the pane with `claude --resume <sid>`.
+    "${TMUX_CMD[@]}" respawn-pane -k -t "$CLAMP_TARGET_PANE" \
+        -c "$CLAMP_PROJECT_DIR" \
+        "claude $CLAMP_CLAUDE_FLAGS --resume $sid"
+}
+
+cmd_reference() {
+    resolve_target
+    local sid
+    sid="$(_thread_picker reference)" || return 0
+    [[ -z "${sid:-}" ]] && return 0
+
+    local target="$CLAMP_TARGET_PANE"
+    local log=/tmp/clamp.log
+    local payload="@@$sid "
+
+    # Stage the text in a named tmux paste buffer (synchronous; survives
+    # popup teardown).
+    "${TMUX_CMD[@]}" set-buffer -b clamp-ref -- "$payload"
+
+    {
+        echo "--- $(date '+%H:%M:%S') reference dispatch"
+        echo "target=$target sid=$sid payload=[$payload]"
+    } >>"$log" 2>&1
+
+    # Defer the paste/send to AFTER the popup closes. We use a tmux-native
+    # `run-shell -b` (background) which runs from the tmux server itself,
+    # not as a child of the popup's shell — so it isn't killed when the
+    # popup tears down.
+    "${TMUX_CMD[@]}" run-shell -b "
+        echo '[bg $(date +%H:%M:%S)] firing paste/send' >> $log 2>&1
+        tmux -L $CLAMP_SOCKET paste-buffer -t $target -d -p -b clamp-ref >> $log 2>&1 || \
+            tmux -L $CLAMP_SOCKET send-keys -t $target -l '$payload' >> $log 2>&1
+        echo '[bg $(date +%H:%M:%S)] paste/send done' >> $log 2>&1
+    "
+}
+
+cmd_new() {
+    resolve_target
+    "${TMUX_CMD[@]}" respawn-pane -k -t "$CLAMP_TARGET_PANE" \
+        -c "$CLAMP_PROJECT_DIR" \
+        "claude $CLAMP_CLAUDE_FLAGS"
+}
+
+usage() {
+    cat <<EOF
+clamp — claude + amp-style thread command palette
+
+Usage:
+  clamp [dir]    Run claude in [dir] (default: \$PWD) wrapped in clamp's
+                 tmux. Press $CLAMP_HOTKEY to open the command palette
+                 (switch / reference / new thread). Quit claude (Ctrl-D or
+                 /exit) to tear everything down.
+
+Setup:
+  ./install.sh   Install or upgrade. Re-run anytime.
+
+Env:
+  CLAMP_HOTKEY        tmux key for the palette  (default: C-g)
+  CLAMP_CLAUDE_FLAGS  flags passed to claude    (default: --dangerously-skip-permissions)
+  CLAMP_SOCKET        tmux -L socket name       (default: clamp)
+EOF
+}
+
+main() {
+    # No args → start in $PWD.
+    if [[ $# -eq 0 ]]; then
+        cmd_start
+        return
+    fi
+
+    case "$1" in
+        start)         shift; cmd_start "$@" ;;
+        kill)          cmd_kill ;;
+        install-skill) cmd_install_skill ;;
+        list-threads)  shift; cmd_list_threads "$@" ;;
+        render)        shift; cmd_render "$@" ;;
+        picker)        cmd_picker ;;
+        switch)        cmd_switch ;;
+        reference)     cmd_reference ;;
+        new)           cmd_new ;;
+        help|-h|--help) usage ;;
+        # Anything else (a path, etc.) is treated as a `start` argument.
+        *) cmd_start "$@" ;;
+    esac
+}
+
+main "$@"
