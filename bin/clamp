@@ -32,7 +32,7 @@ _clamp_resolve_root() {
 readonly CLAMP_ROOT="$(_clamp_resolve_root)"
 readonly CLAMP_LIB="$CLAMP_ROOT/lib"
 readonly CLAMP_SOCKET="${CLAMP_SOCKET:-clamp}"
-readonly CLAMP_HOTKEY="${CLAMP_HOTKEY:-C-g}"
+readonly CLAMP_HOTKEY="${CLAMP_HOTKEY:-C-f}"
 readonly CLAMP_CONF="$CLAMP_ROOT/tmux.conf"
 # Flags passed to every `claude` invocation. Defaults to bypassing permission
 # prompts so the wrapper stays out of your way; override with an env var to

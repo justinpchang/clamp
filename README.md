@@ -3,7 +3,7 @@
 A small wrapper that adds Amp's hotkey-driven thread palette to Claude Code.
 
 It runs `claude` inside an isolated `tmux` server (so it doesn't pollute your
-own tmux), binds a global hotkey (default `C-g`) to a `tmux display-popup`,
+own tmux), binds a global hotkey (default `C-f`) to a `tmux display-popup`,
 and uses `fzf` for the picker UI.
 
 ## What you get
@@ -65,7 +65,7 @@ clamp                   # run claude in $PWD
 clamp ~/dev/myrepo      # run claude in a specific dir
 ```
 
-That's the entire interface. Inside, press **`C-g`** to open the command
+That's the entire interface. Inside, press **`C-f`** to open the command
 palette (switch / reference / new thread). Quit claude (`Ctrl-D` or
 `/exit`) and clamp tears down its tmux server automatically — no daemon
 left behind.
@@ -95,11 +95,11 @@ To see the rendered thread yourself: `clamp render <UUID>`.
 ~/.local/bin/clamp start
      │
      │ tmux -L clamp -f tmux.conf new-session  (cwd-named session, pane 0 runs `claude`)
-     │ tmux -L clamp bind-key -T root C-g  display-popup -E "clamp picker"
+     │ tmux -L clamp bind-key -T root C-f  display-popup -E "clamp picker"
      ▼
   isolated tmux server (socket: "clamp")
      │
-     │ user presses C-g
+     │ user presses C-f
      ▼
   tmux display-popup runs `clamp picker` with CLAMP_TARGET_PANE=#{pane_id}
      │
@@ -133,7 +133,7 @@ Environment variables read by `clamp`:
 
 | Var                   | Default | Meaning |
 |-----------------------|---------|---------|
-| `CLAMP_HOTKEY`        | `C-g`   | tmux key that opens the palette |
+| `CLAMP_HOTKEY`        | `C-f`   | tmux key that opens the palette |
 | `CLAMP_SOCKET`        | `clamp` | `tmux -L` socket name |
 | `CLAMP_HANDOFF_MODEL` | `haiku` | model used for the one-shot summary in `handoff` |
 
