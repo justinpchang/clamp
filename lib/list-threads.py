@@ -39,6 +39,8 @@ def first_user_message(jsonl_path: Path) -> str:
                     continue
                 if obj.get("type") != "user":
                     continue
+                if obj.get("isMeta"):
+                    continue
                 msg = obj.get("message") or {}
                 if msg.get("role") != "user":
                     continue
@@ -46,8 +48,7 @@ def first_user_message(jsonl_path: Path) -> str:
                 text = _extract_text(content)
                 if not text:
                     continue
-                # Skip tool_result and meta-ish messages
-                if text.startswith("<command-") or text.startswith("[Request interrupted"):
+                if text.startswith("<") or text.startswith("[Request interrupted"):
                     continue
                 return _flatten(text)[:200]
     except OSError:

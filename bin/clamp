@@ -55,6 +55,27 @@ _popup_err_trap() {
     read -rsn1 || true
 }
 
+# Look up a thread's title from the on-disk JSONL and return it (or a
+# fallback). Fast enough for one-shot use at window creation time.
+_thread_title() {
+    local sid="$1" proj="$2"
+    local title=""
+    if [[ -n "$sid" ]] && command -v python3 >/dev/null 2>&1; then
+        title="$(python3 "$CLAMP_LIB/list-threads.py" "$proj" 2>/dev/null \
+                 | awk -F'\t' -v s="$sid" '$1==s {print $4; exit}')"
+    fi
+    if [[ -z "$title" ]]; then
+        echo "new thread"
+    else
+        # Truncate long titles for the tab
+        if [[ ${#title} -gt 50 ]]; then
+            echo "${title:0:47}..."
+        else
+            echo "$title"
+        fi
+    fi
+}
+
 # Spawn claude in a new tmux window, tagged with @clamp-sid.
 #   $1 = session name
 #   $2 = project dir
@@ -77,8 +98,12 @@ _spawn_claude_window() {
         claude_args+=("$@")
     fi
 
+    local win_name
+    win_name="$(_thread_title "$sid" "$proj")"
+
     local new_win
     new_win="$("${TMUX_CMD[@]}" new-window -P -F '#{window_id}' -t "=$sess" -c "$proj" \
+        -n "$win_name" \
         "claude ${claude_args[*]}; ${TMUX_CMD[*]} kill-session -t '=$sess' 2>/dev/null")"
 
     if [[ -n "$sid" && -n "$new_win" ]]; then
@@ -148,6 +173,7 @@ cmd_start() {
         sid="$(uuidgen | tr '[:upper:]' '[:lower:]')"
         local initial_win
         initial_win="$("${TMUX_CMD[@]}" -f "$CLAMP_CONF" new-session -d -P -F '#{window_id}' -s "$sess" -c "$dir" \
+            -n "new thread" \
             -e "CLAMP_PROJECT_DIR=$dir" \
             "claude $CLAMP_CLAUDE_FLAGS --session-id $sid; ${TMUX_CMD[*]} kill-session -t '=$sess' 2>/dev/null")"
         {
