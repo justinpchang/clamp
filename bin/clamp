@@ -45,6 +45,62 @@ readonly TMUX_CMD=(tmux -L "$CLAMP_SOCKET")
 
 die() { echo "clamp: $*" >&2; exit 1; }
 
+# Trap ERR in popup/picker subcommands so errors are visible instead of
+# flashing and disappearing when set -e fires.
+_popup_err_trap() {
+    local exit_code=$?
+    echo >&2
+    echo "clamp error (exit $exit_code) — see /tmp/clamp.log" >&2
+    echo "(press any key to close)" >&2
+    read -rsn1 || true
+}
+
+# Spawn claude in a new tmux window, tagged with @clamp-sid.
+#   $1 = session name
+#   $2 = project dir
+#   $3 = session id (uuid) — pass "" to let claude generate one
+#   $4... = extra claude flags (e.g. "--resume <sid>")
+_spawn_claude_window() {
+    local sess="$1" proj="$2" sid="$3"
+    shift 3
+
+    local claude_args=($CLAMP_CLAUDE_FLAGS)
+    local has_resume=false
+    local f
+    for f in "$@"; do
+        [[ "$f" == "--resume" ]] && has_resume=true
+    done
+    if [[ -n "$sid" && "$has_resume" == false ]]; then
+        claude_args+=(--session-id "$sid")
+    fi
+    if [[ $# -gt 0 ]]; then
+        claude_args+=("$@")
+    fi
+
+    local new_win
+    new_win="$("${TMUX_CMD[@]}" new-window -P -F '#{window_id}' -t "=$sess" -c "$proj" \
+        "claude ${claude_args[*]}; ${TMUX_CMD[*]} kill-session -t '=$sess' 2>/dev/null")"
+
+    if [[ -n "$sid" && -n "$new_win" ]]; then
+        "${TMUX_CMD[@]}" set-option -w -t "$new_win" @clamp-sid "$sid" 2>/dev/null || true
+    fi
+}
+
+# Find the window on $sess whose @clamp-sid matches $sid. Prints window id
+# or returns 1.
+_find_window_by_sid() {
+    local sess="$1" sid="$2"
+    local wid wsid
+    while read -r wid wsid; do
+        if [[ "$wsid" == "$sid" ]]; then
+            echo "$wid"
+            return 0
+        fi
+    done < <("${TMUX_CMD[@]}" list-windows -t "=$sess" \
+        -F '#{window_id} #{@clamp-sid}' 2>/dev/null)
+    return 1
+}
+
 # Sanitize a path into a usable tmux session name.
 session_name_for_dir() {
     local dir="$1" base suffix
@@ -67,14 +123,15 @@ session_name_for_dir() {
 
 # Install the hotkey binding on the running server. Idempotent.
 install_bindings() {
-    # Important: `#{pane_id}` is NOT expanded inside the shell-command arg of
-    # display-popup on every tmux build. Use `-e VAR=#{...}` instead, which
-    # is reliably format-expanded at fire time.
+    # display-popup -e does NOT format-expand #{...} — it passes them
+    # literally. Use set-environment -gF (which does expand) chained
+    # before the popup. The popup reads them back via show-environment.
     "${TMUX_CMD[@]}" bind-key -T root "$CLAMP_HOTKEY" \
+        set-environment -gF CLAMP_POPUP_PANE '#{pane_id}' "\;" \
+        set-environment -gF CLAMP_POPUP_TTY '#{client_tty}' "\;" \
+        set-environment -gF CLAMP_POPUP_DIR '#{pane_current_path}' "\;" \
         display-popup -E -w 80% -h 80% \
         -d "#{pane_current_path}" \
-        -e "CLAMP_TARGET_PANE=#{pane_id}" \
-        -e "CLAMP_PROJECT_DIR=#{pane_current_path}" \
         "'$CLAMP_ROOT/bin/clamp' picker"
 }
 
@@ -87,15 +144,21 @@ cmd_start() {
     # Create the session if missing. -f only takes effect when the server is
     # being started for the first time; otherwise it is silently ignored.
     if ! "${TMUX_CMD[@]}" has-session -t "=$sess" 2>/dev/null; then
-        "${TMUX_CMD[@]}" -f "$CLAMP_CONF" new-session -d -s "$sess" -c "$dir" \
+        local sid
+        sid="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+        local initial_win
+        initial_win="$("${TMUX_CMD[@]}" -f "$CLAMP_CONF" new-session -d -P -F '#{window_id}' -s "$sess" -c "$dir" \
             -e "CLAMP_PROJECT_DIR=$dir" \
-            "claude $CLAMP_CLAUDE_FLAGS"
+            "claude $CLAMP_CLAUDE_FLAGS --session-id $sid; ${TMUX_CMD[*]} kill-session -t '=$sess' 2>/dev/null")"
+        {
+            echo "[$(date '+%H:%M:%S')] cmd_start: sess=$sess initial_win=$initial_win sid=$sid"
+        } >>/tmp/clamp.log 2>&1 || true
+        if [[ -n "$initial_win" ]]; then
+            "${TMUX_CMD[@]}" set-option -w -t "$initial_win" @clamp-sid "$sid" 2>/dev/null || true
+        fi
     fi
 
-    # Expose CLAMP_LIB to the tmux server's global env so shell commands
-    # spawned by status-bar #(...) substitutions can find lib/status-line.sh.
-    # Idempotent — safe to re-set on every start.
-    "${TMUX_CMD[@]}" set-environment -g CLAMP_LIB "$CLAMP_LIB"
+    "${TMUX_CMD[@]}" set-environment -g CLAMP_LIB "$CLAMP_LIB" 2>/dev/null || true
 
     # Re-source the conf so an already-running server picks up changes
     # (status-right format, colors, etc.) without requiring `clamp kill`.
@@ -104,7 +167,7 @@ cmd_start() {
     "${TMUX_CMD[@]}" source-file "$CLAMP_CONF" 2>/dev/null || true
     "${TMUX_CMD[@]}" refresh-client -S 2>/dev/null || true
 
-    install_bindings
+    install_bindings 2>/dev/null || true
 
     if [[ -n "${TMUX:-}" ]]; then
         # Already inside another tmux: can't nest attach.
@@ -114,7 +177,7 @@ cmd_start() {
 
     # Attach. When this returns, the user has either detached or claude
     # exited (taking the pane and session with it).
-    "${TMUX_CMD[@]}" attach-session -t "$sess" || true
+    "${TMUX_CMD[@]}" attach-session -t "=$sess" || true
 
     # If no sessions remain on the clamp server, tear the whole server down.
     # That way `clamp` behaves like a foreground app — no daemon left over.
@@ -190,53 +253,75 @@ fatal() {
 }
 
 # Resolve the originating pane id and project dir, populating
-# CLAMP_TARGET_PANE / CLAMP_PROJECT_DIR. Robust against the case where the
-# -e env-var format-expansion didn't fire (still has literal "#{...}").
+# Read format-expanded values stashed by the binding's set-environment
+# commands (see install_bindings). Populates CLAMP_TARGET_PANE,
+# CLAMP_TARGET_SESSION, CLAMP_PROJECT_DIR.
+_read_tmux_var() {
+    "${TMUX_CMD[@]}" show-environment -g "$1" 2>/dev/null | sed 's/^[^=]*=//'
+}
+
 resolve_target() {
-    local target="${CLAMP_TARGET_PANE:-}"
-    if [[ -z "$target" || "$target" == *'#{'* ]]; then
-        # Strategy 1: ask the active client what session it's on, then take
-        # its first pane (clamp sessions only ever have one).
+    local client_tty target tsess=""
+
+    client_tty="$(_read_tmux_var CLAMP_POPUP_TTY)"
+    target="$(_read_tmux_var CLAMP_POPUP_PANE)"
+
+    # Derive session from the client tty.
+    if [[ -n "$client_tty" ]]; then
+        tsess="$("${TMUX_CMD[@]}" list-clients -F '#{client_tty} #{client_session}' 2>/dev/null \
+            | awk -v tty="$client_tty" '$1==tty {print $2; exit}')"
+    fi
+
+    # If we got a session but the pane var was empty/stale, grab the
+    # active pane from that session.
+    if [[ -n "$tsess" && -z "$target" ]]; then
+        target="$("${TMUX_CMD[@]}" list-panes -t "=$tsess" -F '#{pane_id}' 2>/dev/null | head -1 || true)"
+    fi
+
+    # Fallback: no client tty — pick the first client.
+    if [[ -z "$target" ]]; then
         local sess
         sess="$("${TMUX_CMD[@]}" list-clients -F '#{client_session}' 2>/dev/null | head -1 || true)"
         if [[ -n "$sess" ]]; then
-            target="$("${TMUX_CMD[@]}" list-panes -t "$sess" -F '#{pane_id}' 2>/dev/null | head -1 || true)"
+            target="$("${TMUX_CMD[@]}" list-panes -t "=$sess" -F '#{pane_id}' 2>/dev/null | head -1 || true)"
+            [[ -z "$tsess" ]] && tsess="$sess"
         fi
     fi
-    if [[ -z "$target" || "$target" == *'#{'* ]]; then
-        # Strategy 2: just take the first pane across all sessions on this
-        # clamp server. Works even if list-clients returns nothing.
+    if [[ -z "$target" ]]; then
         target="$("${TMUX_CMD[@]}" list-panes -a -F '#{pane_id}' 2>/dev/null | head -1 || true)"
     fi
     if [[ -z "$target" ]]; then
         {
             echo "couldn't determine target pane."
-            echo "  CLAMP_TARGET_PANE=${CLAMP_TARGET_PANE:-<unset>}"
             echo "  list-clients:"
             "${TMUX_CMD[@]}" list-clients 2>&1 | sed 's/^/    /' || true
-            echo "  list-panes -a:"
-            "${TMUX_CMD[@]}" list-panes -a 2>&1 | sed 's/^/    /' || true
         } >>/tmp/clamp.log
         fatal "couldn't determine target pane (see /tmp/clamp.log)"
     fi
 
-    local proj="${CLAMP_PROJECT_DIR:-}"
-    if [[ -z "$proj" || "$proj" == *'#{'* ]]; then
+    if [[ -z "$tsess" ]]; then
+        tsess="$("${TMUX_CMD[@]}" display-message -p -t "$target" '#{session_name}' 2>/dev/null || true)"
+    fi
+
+    local proj
+    proj="$(_read_tmux_var CLAMP_POPUP_DIR)"
+    if [[ -z "$proj" ]]; then
         proj="$("${TMUX_CMD[@]}" display-message -p -t "$target" -F '#{pane_current_path}' 2>/dev/null || true)"
     fi
     [[ -z "$proj" ]] && proj="$PWD"
 
     export CLAMP_TARGET_PANE="$target"
+    export CLAMP_TARGET_SESSION="$tsess"
     export CLAMP_PROJECT_DIR="$proj"
 
-    # Audit trail
     {
-        echo "[$(date '+%H:%M:%S')] resolve_target → pane=$target proj=$proj"
+        echo "[$(date '+%H:%M:%S')] resolve_target → tty=$client_tty pane=$target sess=$tsess proj=$proj"
     } >>/tmp/clamp.log 2>&1 || true
 }
 
 # -------- Picker (top-level command palette) --------
 cmd_picker() {
+    trap _popup_err_trap ERR
     resolve_target
 
     local choice
@@ -262,24 +347,70 @@ cmd_picker() {
 }
 
 # -------- Thread picker shared by switch/reference --------
-# $1 = mode label ("switch"/"reference"), $2 = action callback name
+# $1 = mode label ("switch"/"reference")
+# For "reference" mode, returns just the sid.
+# For "switch" mode, returns "live\t<sid>" or "disk\t<sid>".
 _thread_picker() {
     local mode="$1"
     local proj="${CLAMP_PROJECT_DIR:-$PWD}"
 
-    local lines
-    lines="$(python3 "$CLAMP_LIB/list-threads.py" "$proj")"
-    if [[ -z "$lines" ]]; then
-        echo "No prior threads found for $proj"
-        echo "(Press any key to close)"
+    # Collect running thread sids from tmux windows (newline-delimited for
+    # bash 3.2 compat — no associative arrays).
+    local sess=""
+    if [[ "$mode" == "switch" ]]; then
+        sess="${CLAMP_TARGET_SESSION:-}"
+    fi
+    local running_sids=""
+    if [[ -n "$sess" ]]; then
+        local wsid
+        while read -r wsid; do
+            [[ -n "$wsid" ]] && running_sids+="$wsid"$'\n'
+        done < <("${TMUX_CMD[@]}" list-windows -t "=$sess" -F '#{@clamp-sid}' 2>/dev/null || true)
+    fi
+
+    # Get on-disk threads.
+    local disk_lines
+    disk_lines="$(python3 "$CLAMP_LIB/list-threads.py" "$proj" 2>/dev/null || true)"
+
+    # Build combined list for switch mode: running threads first, then disk.
+    local combined=""
+    if [[ "$mode" == "switch" ]]; then
+        local current_sid=""
+        current_sid="$("${TMUX_CMD[@]}" display-message -p -t "$CLAMP_TARGET_PANE" '#{@clamp-sid}' 2>/dev/null || true)"
+        local sid
+        while read -r sid; do
+            [[ -z "$sid" ]] && continue
+            [[ "$sid" == "$current_sid" ]] && continue
+            local title="(running)"
+            if [[ -n "$disk_lines" ]]; then
+                local disk_title
+                disk_title="$(awk -F'\t' -v s="$sid" '$1==s {print $4; exit}' <<<"$disk_lines")"
+                [[ -n "$disk_title" ]] && title="$disk_title"
+            fi
+            combined+="$sid"$'\t'"0"$'\t'"● running"$'\t'"$title"$'\n'
+        done <<<"$running_sids"
+        # Disk threads not currently running.
+        if [[ -n "$disk_lines" ]]; then
+            while IFS=$'\t' read -r sid mtime rel title; do
+                [[ -z "$sid" ]] && continue
+                if ! echo "$running_sids" | grep -qxF "$sid"; then
+                    combined+="$sid"$'\t'"$mtime"$'\t'"$rel"$'\t'"$title"$'\n'
+                fi
+            done <<<"$disk_lines"
+        fi
+    else
+        combined="$disk_lines"
+    fi
+
+    if [[ -z "$combined" ]]; then
+        echo "No threads found for $proj" >&2
+        echo "(Press any key to close)" >&2
         read -rsn1
         return 1
     fi
 
-    # fzf consumes TSV: <id>\t<mtime>\t<rel>\t<title>
-    # Display: <rel>  <title>  (id hidden but kept in line for selection)
     local sel
-    sel="$(printf '%s\n' "$lines" | fzf \
+    sel="$(printf '%s' "$combined" | fzf \
         --ansi --no-multi --reverse --height=100% \
         --delimiter=$'\t' \
         --with-nth=3,4 \
@@ -288,26 +419,49 @@ _thread_picker() {
         --preview="python3 $CLAMP_LIB/render-thread.py {1} $proj" \
         --preview-window="right,65%,wrap")" || return 0
 
-    # Parse the selected session id (column 1).
     local sid
     sid="$(awk -F'\t' '{print $1}' <<<"$sel")"
     [[ -z "$sid" ]] && return 0
-    echo "$sid"
+
+    if [[ "$mode" == "switch" ]]; then
+        if echo "$running_sids" | grep -qxF "$sid"; then
+            printf 'live\t%s\n' "$sid"
+        else
+            printf 'disk\t%s\n' "$sid"
+        fi
+    else
+        echo "$sid"
+    fi
 }
 
 cmd_switch() {
+    trap _popup_err_trap ERR
     resolve_target
-    local sid
-    sid="$(_thread_picker switch)" || return 0
-    [[ -z "${sid:-}" ]] && return 0
+    local result
+    result="$(_thread_picker switch)" || return 0
+    [[ -z "${result:-}" ]] && return 0
 
-    # Respawn the pane with `claude --resume <sid>`.
-    "${TMUX_CMD[@]}" respawn-pane -k -t "$CLAMP_TARGET_PANE" \
-        -c "$CLAMP_PROJECT_DIR" \
-        "claude $CLAMP_CLAUDE_FLAGS --resume $sid"
+    local kind sid
+    kind="$(awk -F'\t' '{print $1}' <<<"$result")"
+    sid="$(awk -F'\t' '{print $2}' <<<"$result")"
+
+    local sess="${CLAMP_TARGET_SESSION:-}"
+    [[ -z "$sess" ]] && return 0
+
+    if [[ "$kind" == "live" ]]; then
+        local win
+        if win="$(_find_window_by_sid "$sess" "$sid")"; then
+            "${TMUX_CMD[@]}" select-window -t "$win"
+        else
+            _spawn_claude_window "$sess" "$CLAMP_PROJECT_DIR" "$sid" --resume "$sid"
+        fi
+    else
+        _spawn_claude_window "$sess" "$CLAMP_PROJECT_DIR" "$sid" --resume "$sid"
+    fi
 }
 
 cmd_reference() {
+    trap _popup_err_trap ERR
     resolve_target
     local sid
     sid="$(_thread_picker reference)" || return 0
@@ -339,10 +493,13 @@ cmd_reference() {
 }
 
 cmd_new() {
+    trap _popup_err_trap ERR
     resolve_target
-    "${TMUX_CMD[@]}" respawn-pane -k -t "$CLAMP_TARGET_PANE" \
-        -c "$CLAMP_PROJECT_DIR" \
-        "claude $CLAMP_CLAUDE_FLAGS"
+    local sess="${CLAMP_TARGET_SESSION:-}"
+    [[ -z "$sess" ]] && return 0
+    local sid
+    sid="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+    _spawn_claude_window "$sess" "$CLAMP_PROJECT_DIR" "$sid"
 }
 
 # -------- Handoff: summarize current thread, prefill new one --------
@@ -361,6 +518,7 @@ cmd_new() {
 #   5. Stage the prompt in a tmux paste buffer, respawn the pane with a
 #      fresh `claude`, and defer the paste-buffer until claude is up.
 cmd_handoff() {
+    trap _popup_err_trap ERR
     resolve_target
     local proj="$CLAMP_PROJECT_DIR"
 
@@ -451,29 +609,30 @@ Handoff summary:
 $handoff_summary
 "
 
-    # Stage and dispatch. Same deferred-paste trick as cmd_reference, but we
-    # also respawn the pane first with a fresh claude. The sleep gives
-    # claude's TUI time to come up before we shove keystrokes at it.
-    local target="$CLAMP_TARGET_PANE"
+    local sess="${CLAMP_TARGET_SESSION:-}"
+    [[ -z "$sess" ]] && return 0
+    local new_sid
+    new_sid="$(uuidgen | tr '[:upper:]' '[:lower:]')"
     local log=/tmp/clamp.log
 
     "${TMUX_CMD[@]}" set-buffer -b clamp-handoff -- "$new_prompt"
 
     {
         echo "--- $(date '+%H:%M:%S') handoff dispatch"
-        echo "target=$target src_sid=$current_sid intent=[$user_intent]"
+        echo "sess=$sess new_sid=$new_sid src_sid=$current_sid intent=[$user_intent]"
         echo "summary_len=${#handoff_summary}"
     } >>"$log" 2>&1
 
-    "${TMUX_CMD[@]}" respawn-pane -k -t "$target" \
-        -c "$CLAMP_PROJECT_DIR" \
-        "claude $CLAMP_CLAUDE_FLAGS"
+    _spawn_claude_window "$sess" "$CLAMP_PROJECT_DIR" "$new_sid"
 
-    # Defer paste so it runs after this popup closes AND claude has booted.
+    # Defer paste so it runs after the popup closes AND claude has booted.
+    # Target the new window's pane (the most recently created one).
+    local new_pane
+    new_pane="$("${TMUX_CMD[@]}" list-panes -t "=$sess" -F '#{pane_id}' 2>/dev/null | tail -1)"
     "${TMUX_CMD[@]}" run-shell -b "
         echo '[bg $(date +%H:%M:%S)] handoff: waiting for claude to boot' >> $log 2>&1
         sleep 1.5
-        tmux -L $CLAMP_SOCKET paste-buffer -t $target -d -p -b clamp-handoff >> $log 2>&1 || true
+        tmux -L $CLAMP_SOCKET paste-buffer -t $new_pane -d -p -b clamp-handoff >> $log 2>&1 || true
         echo '[bg $(date +%H:%M:%S)] handoff: paste done' >> $log 2>&1
     "
 }
