@@ -47,13 +47,22 @@ die() { echo "clamp: $*" >&2; exit 1; }
 
 # Sanitize a path into a usable tmux session name.
 session_name_for_dir() {
-    local dir="$1" base
+    local dir="$1" base suffix
     base="$(basename "$dir")"
     # tmux disallows '.' and ':' in session names
     base="${base//./_}"
     base="${base//:/_}"
     [[ -z "$base" ]] && base="clamp"
-    echo "$base"
+    # Per-terminal suffix so sibling clamp invocations on the same dir get
+    # distinct sessions. tty is stable per terminal tab, so re-running clamp
+    # in the same tab re-attaches; a new tab gets a fresh session.
+    if suffix="$(tty 2>/dev/null)"; then
+        suffix="${suffix#/dev/}"
+        suffix="${suffix//\//_}"
+    else
+        suffix="$$"
+    fi
+    echo "$base-$suffix"
 }
 
 # Install the hotkey binding on the running server. Idempotent.
